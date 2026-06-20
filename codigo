@@ -1,0 +1,540 @@
+import customtkinter as ctk
+import requests
+import re
+import time
+import threading
+
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("green")
+
+COR_DESTAQUE = "#2ecc71"
+COR_ERRO = "#e74c3c"
+COR_FUNDO_SECAO = "#1e1e2e"
+COR_BORDA = "#2a2a3e"
+
+
+def fmt(val, fallback="N/I"):
+    if val is None:
+        return fallback
+    if isinstance(val, str) and val.strip() == "":
+        return fallback
+    return str(val).strip()
+
+
+def fmt_moeda(val):
+    if not val:
+        return "N/I"
+    try:
+        num = float(str(val).replace(",", "."))
+        return f"R$ {num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return str(val)
+
+
+def fmt_cnpj(val):
+    if not val:
+        return "N/I"
+    nums = re.sub(r"\D", "", str(val))
+    if len(nums) == 14:
+        return f"{nums[:2]}.{nums[2:5]}.{nums[5:8]}/{nums[8:12]}-{nums[12:]}"
+    return val
+
+
+def fmt_telefone(ddd, numero):
+    if not numero:
+        return None
+    tel = re.sub(r"\D", "", str(numero))
+    if ddd:
+        ddd = re.sub(r"\D", "", str(ddd))
+    if ddd:
+        if len(tel) == 8:
+            return f"({ddd}) {tel[:4]}-{tel[4:]}"
+        elif len(tel) == 9:
+            return f"({ddd}) {tel[:5]}-{tel[5:]}"
+        else:
+            return f"({ddd}) {tel}"
+    else:
+        if len(tel) == 8:
+            return f"{tel[:4]}-{tel[4:]}"
+        elif len(tel) == 9:
+            return f"{tel[:5]}-{tel[5:]}"
+        return tel
+
+
+def fmt_cep(val):
+    if not val:
+        return "N/I"
+    nums = re.sub(r"\D", "", str(val))
+    if len(nums) == 8:
+        return f"{nums[:5]}-{nums[5:]}"
+    return val
+
+
+class Secao(ctk.CTkFrame):
+    def __init__(self, master, titulo, **kwargs):
+        super().__init__(master, fg_color=COR_FUNDO_SECAO, corner_radius=10, **kwargs)
+        self.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self, fg_color="transparent", height=32)
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        header.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            header, text=titulo, font=("Segoe UI", 14, "bold"),
+            text_color=COR_DESTAQUE, anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+
+        self.linhas = []
+
+    def linha(self, rotulo, valor, destaque=False, cor_valor=None):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.grid_columnconfigure(1, weight=1)
+        row = len(self.linhas)
+        frame.grid(row=row + 1, column=0, sticky="ew", padx=16, pady=1)
+
+        cor_texto = cor_valor or ("#f0f0f0" if not destaque else COR_DESTAQUE)
+
+        ctk.CTkLabel(
+            frame, text=rotulo, font=("Segoe UI", 12),
+            text_color="#888899", anchor="w", width=200
+        ).grid(row=0, column=0, sticky="w")
+
+        lbl = ctk.CTkLabel(
+            frame, text=valor, font=("Segoe UI", 12, "bold" if destaque else "normal"),
+            text_color=cor_texto, anchor="w", wraplength=500
+        )
+        lbl.grid(row=0, column=1, sticky="w")
+        self.linhas.append(frame)
+        return lbl
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Consulta CNPJ")
+        self.geometry("800x800")
+        self.minsize(600, 500)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        self.ultima_requisicao = 0
+        self.INTERVALO = 21
+        self.consultando = False
+
+        self._criar_topo()
+        self._criar_entrada()
+        self._criar_resultados()
+
+    def _criar_topo(self):
+        topo = ctk.CTkFrame(self, fg_color="transparent", height=60)
+        topo.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 0))
+        topo.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            topo, text="Consulta CNPJ", font=("Segoe UI", 28, "bold"),
+            text_color=COR_DESTAQUE
+        ).pack(anchor="center")
+
+        ctk.CTkLabel(
+            topo, text="Consulte dados completos de empresas brasileiras",
+            font=("Segoe UI", 12), text_color="#666680"
+        ).pack(anchor="center")
+
+    def _criar_entrada(self):
+        entrada = ctk.CTkFrame(self, fg_color=COR_FUNDO_SECAO, corner_radius=12)
+        entrada.grid(row=1, column=0, sticky="ew", padx=20, pady=16)
+        entrada.grid_columnconfigure((0, 1), weight=1)
+
+        self.cnpj_var = ctk.StringVar()
+        self.uf_var = ctk.StringVar(value="SP")
+
+        self.cnpj_var.trace_add("write", self._mascara_cnpj)
+
+        ctk.CTkLabel(
+            entrada, text="CNPJ", font=("Segoe UI", 11), text_color="#888899"
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
+        self.cnpj_entry = ctk.CTkEntry(
+            entrada, textvariable=self.cnpj_var, font=("Segoe UI", 16),
+            placeholder_text="00.000.000/0001-91", height=40, corner_radius=8
+        )
+        self.cnpj_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+
+        ctk.CTkLabel(
+            entrada, text="UF", font=("Segoe UI", 11), text_color="#888899"
+        ).grid(row=0, column=1, sticky="w", padx=12, pady=(12, 2))
+        self.uf_entry = ctk.CTkEntry(
+            entrada, textvariable=self.uf_var, font=("Segoe UI", 16),
+            placeholder_text="SP", height=40, width=80, corner_radius=8
+        )
+        self.uf_entry.grid(row=1, column=1, sticky="w", padx=12, pady=(0, 12))
+
+        self.btn_consultar = ctk.CTkButton(
+            entrada, text="Consultar", font=("Segoe UI", 14, "bold"),
+            height=40, corner_radius=8, command=self._iniciar_consulta
+        )
+        self.btn_consultar.grid(row=1, column=2, padx=(0, 12), pady=(0, 12))
+
+        self.spinner_label = ctk.CTkLabel(
+            entrada, text="", font=("Segoe UI", 18), text_color=COR_DESTAQUE,
+            width=24
+        )
+        self.spinner_label.grid(row=1, column=3, padx=(0, 4), pady=(0, 12))
+
+        self.aviso_label = ctk.CTkLabel(
+            entrada, text="", font=("Segoe UI", 11), text_color=COR_ERRO
+        )
+        self.aviso_label.grid(row=2, column=0, columnspan=4, sticky="ew", padx=12, pady=(0, 8))
+
+    def _criar_resultados(self):
+        container = ctk.CTkFrame(self, fg_color="transparent")
+        container.grid(row=2, column=0, sticky="nsew", padx=20, pady=(0, 20))
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+
+        self.scroll = ctk.CTkScrollableFrame(
+            container, fg_color="transparent", corner_radius=0
+        )
+        self.scroll.grid(row=0, column=0, sticky="nsew")
+        self.scroll.grid_columnconfigure(0, weight=1)
+
+        self.spinner_frames = ["◜", "◝", "◞", "◟"]
+        self.spinner_idx = 0
+        self.spinner_after_id = None
+        self.result_area = self.scroll
+
+    def _mascara_cnpj(self, *args):
+        entry = self.cnpj_entry
+        texto = entry.get()
+        pos = entry.index("insert")
+
+        texto_ate = texto[:pos]
+        digs_ate = len(re.sub(r"\D", "", texto_ate))
+
+        nums = re.sub(r"\D", "", texto)[:14]
+        masc = ""
+        if len(nums) > 0:
+            masc += nums[:2]
+        if len(nums) > 2:
+            masc += "." + nums[2:5]
+        if len(nums) > 5:
+            masc += "." + nums[5:8]
+        if len(nums) > 8:
+            masc += "/" + nums[8:12]
+        if len(nums) > 12:
+            masc += "-" + nums[12:]
+
+        if texto != masc:
+            nova_pos = 0
+            dig_cont = 0
+            for ch in masc:
+                if dig_cont >= digs_ate:
+                    break
+                nova_pos += 1
+                if ch.isdigit():
+                    dig_cont += 1
+
+            entry.delete(0, "end")
+            entry.insert(0, masc)
+            entry.icursor(nova_pos)
+
+    def _spinner_iniciar(self):
+        self.spinner_idx = 0
+        self._spinner_tick()
+
+    def _spinner_tick(self):
+        self.spinner_label.configure(text=self.spinner_frames[self.spinner_idx])
+        self.spinner_idx = (self.spinner_idx + 1) % len(self.spinner_frames)
+        self.spinner_after_id = self.after(120, self._spinner_tick)
+
+    def _spinner_parar(self):
+        if self.spinner_after_id:
+            self.after_cancel(self.spinner_after_id)
+            self.spinner_after_id = None
+        self.spinner_label.configure(text="")
+
+    def _iniciar_consulta(self):
+        if self.consultando:
+            return
+
+        self.consultando = True
+        self.aviso_label.configure(text="")
+        self.btn_consultar.configure(state="disabled", text="Consultando...")
+
+        for w in self.result_area.winfo_children():
+            w.destroy()
+
+        self._spinner_iniciar()
+
+        threading.Thread(target=self._consultar_api, daemon=True).start()
+
+    def _consultar_api(self):
+        try:
+            cnpj_raw = self.cnpj_var.get()
+            cnpj_limpo = re.sub(r"\D", "", cnpj_raw)
+            uf = self.uf_var.get().strip().upper()
+
+            if len(cnpj_limpo) != 14:
+                self.after(0, self._erro, "CNPJ inválido. Deve ter 14 dígitos.")
+                return
+            if not uf or len(uf) != 2:
+                self.after(0, self._erro, "UF inválida. Digite 2 letras (ex: SP).")
+                return
+
+            agora = time.time()
+            desde = agora - self.ultima_requisicao
+            if desde < self.INTERVALO:
+                espera = self.INTERVALO - desde
+                self.after(0, self._aviso, f"Aguardando {espera:.0f}s (limite de 3 req/min)...")
+                time.sleep(espera)
+
+            url = f"https://publica.cnpj.ws/cnpj/{cnpj_limpo}"
+            resp = requests.get(url, timeout=15)
+            self.ultima_requisicao = time.time()
+
+            if resp.status_code == 429:
+                self.after(0, self._erro, "Limite de requisições excedido. Aguarde 1 minuto.")
+                return
+            if resp.status_code != 200:
+                self.after(0, self._erro, f"Erro {resp.status_code} ao consultar API.")
+                return
+
+            data = resp.json()
+            self.after(0, self._exibir_resultados, data, uf)
+        except requests.exceptions.Timeout:
+            self.after(0, self._erro, "Tempo limite excedido. Verifique sua conexão.")
+        except requests.exceptions.ConnectionError:
+            self.after(0, self._erro, "Erro de conexão. Verifique sua internet.")
+        except Exception as e:
+            self.after(0, self._erro, f"Erro inesperado: {e}")
+
+    def _aviso(self, msg):
+        self.aviso_label.configure(text=msg)
+
+    def _erro(self, msg):
+        self._spinner_parar()
+        self.btn_consultar.configure(state="normal", text="Consultar")
+        self.consultando = False
+        self.aviso_label.configure(text=msg)
+
+        ctk.CTkLabel(
+            self.result_area, text=msg, font=("Segoe UI", 14),
+            text_color=COR_ERRO, anchor="center"
+        ).pack(expand=True, pady=40)
+
+    def _exibir_resultados(self, data, uf):
+        self._spinner_parar()
+        self.btn_consultar.configure(state="normal", text="Consultar")
+        self.consultando = False
+
+        estab = data.get("estabelecimento", {})
+
+        self._secao_dados(data, estab)
+        self._secao_situacao(estab)
+        self._secao_simples(data)
+        self._secao_endereco(estab)
+        self._secao_contato(estab)
+        self._secao_atividades(estab)
+        self._secao_ie(estab, uf)
+        self._secao_socios(data)
+        self._secao_adicionais(data, estab)
+
+        self.scroll._parent_canvas.yview_moveto(0)
+
+    def _secao_dados(self, data, estab):
+        secao = Secao(self.result_area, "Dados da Empresa")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        secao.linha("CNPJ", fmt_cnpj(estab.get("cnpj")), destaque=True)
+        secao.linha("Razão Social", fmt(data.get("razao_social")), destaque=True)
+        secao.linha("Nome Fantasia", fmt(estab.get("nome_fantasia"), "Não informado"))
+        secao.linha("Tipo", fmt(estab.get("tipo")))
+        secao.linha("Porte", fmt(data.get("porte", {}).get("descricao")))
+        secao.linha("Natureza Jurídica", fmt(data.get("natureza_juridica", {}).get("descricao")))
+        secao.linha("Capital Social", fmt_moeda(data.get("capital_social")), destaque=True)
+        secao.linha("Responsável Federativo", fmt(data.get("responsavel_federativo")))
+        qualif = data.get("qualificacao_do_responsavel", {})
+        if isinstance(qualif, dict):
+            secao.linha("Qualificação", fmt(qualif.get("descricao")))
+        secao.linha("Início Atividade", fmt(estab.get("data_inicio_atividade")))
+
+    def _secao_situacao(self, estab):
+        secao = Secao(self.result_area, "Situação Cadastral")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        sit = estab.get("situacao_cadastral", "")
+        cor_sit = COR_DESTAQUE if sit.upper() in ("ATIVA", "ATIVO") else COR_ERRO
+        secao.linha("Situação", fmt(sit), cor_valor=cor_sit)
+        secao.linha("Data Situação", fmt(estab.get("data_situacao_cadastral")))
+        if estab.get("situacao_especial"):
+            secao.linha("Situação Especial", fmt(estab["situacao_especial"]))
+            secao.linha("Data Situação Esp.", fmt(estab.get("data_situacao_especial")))
+        if estab.get("motivo_situacao_cadastral"):
+            secao.linha("Motivo", fmt(estab["motivo_situacao_cadastral"]))
+
+    def _secao_simples(self, data):
+        simples = data.get("simples", {})
+        if not simples:
+            return
+        secao = Secao(self.result_area, "Simples Nacional / MEI")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        is_simples = simples.get("simples")
+        cor_s = COR_DESTAQUE if is_simples else COR_ERRO
+        texto_s = "Sim" if is_simples else "Não"
+        secao.linha("Optante Simples", texto_s, cor_valor=cor_s)
+        if simples.get("data_opcao_simples"):
+            secao.linha("Data Opção", simples["data_opcao_simples"])
+        if simples.get("data_exclusao_simples"):
+            secao.linha("Data Exclusão", simples["data_exclusao_simples"], cor_valor=COR_ERRO)
+        is_mei = simples.get("mei")
+        cor_m = COR_DESTAQUE if is_mei else COR_ERRO
+        texto_m = "Sim" if is_mei else "Não"
+        secao.linha("Optante MEI", texto_m, cor_valor=cor_m)
+        if simples.get("data_opcao_mei"):
+            secao.linha("Data Opção MEI", simples["data_opcao_mei"])
+        if simples.get("data_exclusao_mei"):
+            secao.linha("Data Exclusão MEI", simples["data_exclusao_mei"], cor_valor=COR_ERRO)
+
+    def _secao_endereco(self, estab):
+        secao = Secao(self.result_area, "Endereço")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        lograd = f"{estab.get('tipo_logradouro', '')} {estab.get('logradouro', '')}".strip()
+        numero = fmt(estab.get("numero"))
+        compl = fmt(estab.get("complemento"), "")
+        bairro = fmt(estab.get("bairro"))
+        cidade = estab.get("cidade", {})
+        estado = estab.get("estado", {})
+        cidade_nome = cidade.get("nome", "") if isinstance(cidade, dict) else cidade
+        estado_sigla = estado.get("sigla", "") if isinstance(estado, dict) else estado
+
+        endereco = f"{lograd}, {numero}"
+        if compl and compl != "N/I":
+            endereco += f" - {compl}"
+        secao.linha("Logradouro", endereco, destaque=True)
+        secao.linha("Bairro", bairro)
+        secao.linha("Município", f"{cidade_nome} / {estado_sigla}")
+        secao.linha("CEP", fmt_cep(estab.get("cep")))
+
+    def _secao_contato(self, estab):
+        secao = Secao(self.result_area, "Contato")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        secao.linha("Email", fmt(estab.get("email"), "Nenhum email encontrado"))
+
+        telefones = []
+        for ddd_key, tel_key in [("ddd1", "telefone1"), ("ddd2", "telefone2")]:
+            tel = fmt_telefone(estab.get(ddd_key), estab.get(tel_key))
+            if tel:
+                telefones.append(tel)
+        fax = fmt_telefone(estab.get("ddd_fax"), estab.get("fax"))
+        if fax:
+            telefones.append(f"Fax: {fax}")
+
+        if telefones:
+            for i, t in enumerate(telefones, 1):
+                secao.linha(f"Telefone {i}" if i <= 2 else f"Contato {i}", t, destaque=(i == 1))
+        else:
+            secao.linha("Telefone", "Nenhum telefone encontrado")
+
+    def _secao_atividades(self, estab):
+        secao = Secao(self.result_area, "Atividades")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        atv_princ = estab.get("atividade_principal", {})
+        if atv_princ:
+            secao.linha(
+                "CNAE Principal",
+                f"{atv_princ.get('id', '')} - {fmt(atv_princ.get('descricao'))}",
+                destaque=True
+            )
+
+        atvs_sec = estab.get("atividades_secundarias", [])
+        if atvs_sec:
+            qtd = len(atvs_sec)
+            for i, atv in enumerate(atvs_sec[:5]):
+                rot = "Secundária" if i == 0 else ""
+                secao.linha(
+                    rot,
+                    f"{atv.get('id', '')} - {fmt(atv.get('descricao'))}"
+                )
+            if qtd > 5:
+                secao.linha("", f"... e mais {qtd - 5} atividade(s)")
+
+    def _secao_ie(self, estab, uf):
+        secao = Secao(self.result_area, "Inscrições Estaduais / ICMS")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        ies = estab.get("inscricoes_estaduais", [])
+        if not ies:
+            secao.linha(f"Contribuinte ICMS na {uf}", "Não", cor_valor=COR_ERRO)
+            secao.linha("", "Nenhuma inscrição estadual encontrada")
+            return
+
+        ie_uf = [ie for ie in ies if ie["estado"]["sigla"] == uf]
+        if ie_uf and ie_uf[0].get("ativo"):
+            secao.linha(f"Contribuinte ICMS na {uf}", "Sim", destaque=True, cor_valor=COR_DESTAQUE)
+        else:
+            secao.linha(f"Contribuinte ICMS na {uf}", "Não", cor_valor=COR_ERRO)
+
+        encontrada = False
+        for ie in ies:
+            sigla = ie["estado"]["sigla"]
+            ativo = ie.get("ativo", False)
+            ie_num = ie["inscricao_estadual"]
+            status = "Ativo" if ativo else "Inativo"
+            cor = COR_DESTAQUE if ativo else COR_ERRO
+
+            if sigla == uf:
+                encontrada = True
+                secao.linha(f">> {sigla}", f"{ie_num} ({status})", destaque=True, cor_valor=COR_DESTAQUE)
+            else:
+                secao.linha(f"  {sigla}", f"{ie_num} ({status})", cor_valor=cor)
+
+        if not encontrada:
+            secao.linha(f"  {uf}", "Não encontrada", cor_valor=COR_ERRO)
+
+    def _secao_socios(self, data):
+        socios = data.get("socios", [])
+        if not socios:
+            return
+        secao = Secao(self.result_area, f"Sócios ({len(socios)})")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        for i, socio in enumerate(socios, 1):
+            nome = fmt(socio.get("nome"))
+            tipo = fmt(socio.get("tipo"))
+            qual = socio.get("qualificacao_socio", {})
+            qual_desc = fmt(qual.get("descricao")) if isinstance(qual, dict) else ""
+            entrada = socio.get("data_entrada")
+
+            texto = nome
+            if tipo and tipo != "N/I":
+                texto += f" ({tipo})"
+            secao.linha(f"Sócio {i}", texto, destaque=(i == 1))
+            if qual_desc and qual_desc != "N/I":
+                secao.linha("", qual_desc)
+            if entrada:
+                secao.linha("", f"Desde: {entrada}")
+
+    def _secao_adicionais(self, data, estab):
+        secao = Secao(self.result_area, "Informações Adicionais")
+        secao.grid(row=len(self.result_area.winfo_children()), column=0, sticky="ew", pady=(0, 8))
+
+        secao.linha("CNPJ Raiz", fmt(data.get("cnpj_raiz")))
+        secao.linha("Atualizado em", fmt(data.get("atualizado_em")))
+        if estab.get("pais"):
+            pais = estab["pais"]
+            if isinstance(pais, dict):
+                secao.linha("País", fmt(pais.get("nome")))
+        if estab.get("cnpj_ordem") and estab.get("cnpj_digito_verificador"):
+            secao.linha(
+                "Ordem/DV",
+                f"{estab['cnpj_ordem']}/{estab['cnpj_digito_verificador']}"
+            )
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
